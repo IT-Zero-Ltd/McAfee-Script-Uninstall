@@ -597,6 +597,14 @@ function Get-LocalFileIfMissing {
     }
 }
 
+# Windows PowerShell 5.1 can default to TLS 1.0/1.1, which GitHub refuses; make sure TLS 1.2 is enabled.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+catch {
+    Write-Log ("Could not enable TLS 1.2: {0}" -f $_) "WARNING"
+}
+
 $downloadAttempts = 3
 $downloadDelay    = 15
 for ($i = 1; $i -le $downloadAttempts; $i++) {
