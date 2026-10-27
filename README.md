@@ -103,6 +103,18 @@ Operational Notes
 - Detection threshold is intentionally conservative (`10` files).
 - If you need to force re-evaluation immediately, remove marker file and rerun detection/remediation.
 
+Testing on a VM
+---------------
+
+`tests/Test-VMSafety.ps1` checks the safety behaviour on a real Windows machine. Run it **once, elevated, on a disposable test VM with no McAfee installed** (take a snapshot first):
+
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File .\tests\Test-VMSafety.ps1                  # ~2-3 minutes
+powershell.exe -ExecutionPolicy Bypass -File .\tests\Test-VMSafety.ps1 -IncludeFullRun   # also downloads payloads and runs the cleanup tool
+```
+
+It runs the real scripts as SYSTEM under Windows PowerShell 5.1 (as Intune does) against nine scenarios: working-folder lockdown, a real standard user being denied, planted files and junctions, legacy files/task retirement, untrusted and future-dated markers, and managed McAfee being left alone. It uses a temporary local user, scheduled task and registry entries, all removed afterwards. Results are saved to `C:\ProgramData\ITZero-VMTest\results.txt`; the exit code is the number of failures.
+
 Troubleshooting
 ---------------
 
