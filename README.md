@@ -16,8 +16,9 @@ High-Level Behavior
 
 ### Detection (`mcafee_detect.ps1`)
 
+- **Scope:** consumer McAfee only. If managed McAfee/Trellix is present (McAfee/Trellix Agent, Endpoint Security, VirusScan Enterprise, encryption/DLP products, the `masvc`/`macmnsvc` agent services, or `Program Files\McAfee\Agent`, `Program Files\McAfee\Endpoint Security`, `Program Files\Trellix`), detection returns `0` with "out of scope" in its output and remediation makes no changes.
 - Returns `1` when McAfee is still considered installed:
-  - McAfee uninstall registry traces exist, or
+  - McAfee uninstall registry entries exist (each product subkey is checked), or
   - McAfee file count in known folders is above threshold (`> 10`).
 - Returns `0` when compliant/removed.
 - Supports reboot marker flow:
@@ -32,7 +33,9 @@ High-Level Behavior
 - Downloads cleanup payloads at runtime from this repository (pinned commit, SHA256-verified):
   - `mcafeeclean.zip`
   - `mccleanup.zip`
-- Removes registry traces, AppX/provisioned package traces, known folders, and leftover uninstall entries.
+- Removes registry traces, AppX/provisioned package traces and known folders.
+- Removes a McAfee uninstall registry entry only if its uninstaller succeeded (exit 0, 1605, 1614, 1641 or 3010) or the product is verifiably gone (uninstaller missing, or MSI product no longer registered). Entries for products that failed to uninstall are kept and logged, so detection keeps flagging the device.
+- Exits without changes on devices with managed McAfee/Trellix (same check as detection).
 - Uses a state model from `Get-McAfeeStatus`:
   - `0` = clean
   - `1` = installed/significant remnants
