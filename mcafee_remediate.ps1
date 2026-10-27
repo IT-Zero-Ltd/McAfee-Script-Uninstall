@@ -6,11 +6,11 @@
      C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\RemoveMcAfee.log.
   2. Uses an enhanced detection function that checks for registry traces and
      counts files in common McAfee folders. It distinguishes:
-       - State 0 (“Clean”): No registry traces and no leftover files.
-       - State 2 (“Residual”): No registry traces and ≤10 leftover files, but
-         file‑locking processes (e.g. QcShm.exe) are running (a reboot is required).
-       - State 1 (“Installed”): Registry traces exist or more than 10 files remain.
-  3. In the pre‑check:
+       - State 0 ("Clean"): No registry traces and no leftover files.
+       - State 2 ("Residual"): No registry traces and <=10 leftover files, but
+         file-locking processes (e.g. QcShm.exe) are running (a reboot is required).
+       - State 1 ("Installed"): Registry traces exist or more than 10 files remain.
+  3. In the pre-check:
        - If state 0 (clean) or state 2 (residual), the script requests a restart
          (if residual) and exits with code 0.
        - Only if state 1 is detected does remediation proceed.
@@ -22,7 +22,7 @@
      removes directories and temporary files.
   5. After cleanup, it performs a final detection. If the result is state 0 or 2,
      it requests a restart (if residual) and exits with 0; if state 1 is
-     still detected, it exits with 1 so that remediation will be re‑attempted.
+     still detected, it exits with 1 so that remediation will be re-attempted.
 .NOTES
   Must run under SYSTEM (device context) for sufficient privileges.
 #>
@@ -645,7 +645,7 @@ switch ($status.State) {
         exit 0
     }
     2 {
-        Write-Log "Pre-check: Residual McAfee files detected (≤10 files with QcShm.exe running); a restart is required to clear file locks." "INFO"
+        Write-Log "Pre-check: Residual McAfee files detected (<=10 files with QcShm.exe running); a restart is required to clear file locks." "INFO"
         if (-not (Request-RestartForCleanup -Reason "ResidualState")) { exit 1 }
         exit 0
     }
@@ -1020,7 +1020,7 @@ switch ($status.State) {
         exit 0
     }
     2 {
-        Write-Log "Final detection: Residual McAfee files remain (≤10 files with QcShm.exe running). A restart is required to clear file locks." "INFO"
+        Write-Log "Final detection: Residual McAfee files remain (<=10 files with QcShm.exe running). A restart is required to clear file locks." "INFO"
         if (-not (Request-RestartForCleanup -Reason "ResidualStateFinal")) { exit 1 }
         exit 0
     }
