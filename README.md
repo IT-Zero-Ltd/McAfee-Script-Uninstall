@@ -11,6 +11,12 @@ Files
 | `mcafee_detect.ps1` | Detection script for Intune Proactive Remediations. |
 | `mcafee_remediate.ps1` | Remediation/uninstall script with cleanup + reboot handling. |
 
+Deployment options
+------------------
+
+- **Intune Remediations** (needs Windows Enterprise E3/E5, Education A3/A5 or VDA licensing): upload `mcafee_detect.ps1` as detection and `mcafee_remediate.ps1` as remediation; run as SYSTEM (logged-on credentials: No), signature check No, **64-bit PowerShell: Yes**, schedule Daily.
+- **Datto RMM** (e.g. for Microsoft 365 Business Premium clients): see [`datto/README.md`](datto/README.md) for a removal component and a monitor component.
+
 High-Level Behavior
 -------------------
 
