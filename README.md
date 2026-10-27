@@ -21,7 +21,7 @@ High-Level Behavior
   - McAfee file count in known folders is above threshold (`> 10`).
 - Returns `0` when compliant/removed.
 - Supports reboot marker flow:
-  - If `C:\ProgramData\Debloat\McAfeeRemoval.reboot.json` exists and reboot has not occurred yet, detection returns `0` (temporary compliant state).
+  - If `C:\ProgramData\ITZero-McAfeeRemoval\McAfeeRemoval.reboot.json` exists and reboot has not occurred yet, detection returns `0` (temporary compliant state).
   - If marker is older than 48 hours, detection returns `1` to re-trigger remediation.
   - If reboot happened after marker creation, marker is cleared and normal detection resumes.
 
@@ -45,10 +45,10 @@ When locked files or reboot-required conditions are detected:
 
 1. Remediation schedules reboot at local midnight (`shutdown.exe /r /t <seconds>`).
 2. Remediation writes marker:
-   - `C:\ProgramData\Debloat\McAfeeRemoval.reboot.json`
+   - `C:\ProgramData\ITZero-McAfeeRemoval\McAfeeRemoval.reboot.json`
 3. Remediation registers one-shot startup task:
    - Task name: `McAfeeRemovalPostReboot`
-   - Staged script path: `C:\ProgramData\Debloat\mcafee_remediate_postreboot.ps1`
+   - Staged script path: `C:\ProgramData\ITZero-McAfeeRemoval\mcafee_remediate_postreboot.ps1`
    - Runs with `-PostReboot`
    - Self-deletes after execution.
 4. Remediation exits `0` so HealthScripts does not record a hard failure while waiting for reboot.
@@ -86,6 +86,9 @@ Operational Notes
 -----------------
 
 - Must run in SYSTEM/device context for full cleanup capability.
+- All working files (ZIPs, extraction folders, reboot marker, post-reboot script) live in `C:\ProgramData\ITZero-McAfeeRemoval`, which the remediation script locks down on every run: owned by SYSTEM, access for SYSTEM and Administrators only, no inherited permissions. Anything inside it not created by SYSTEM/Administrators, and any junction or link, is removed. If the folder cannot be secured, the script stops without running any cleanup tool.
+- Detection only honours a reboot marker owned by SYSTEM/Administrators in that folder, and treats a future-dated marker as invalid.
+- Earlier versions used `C:\ProgramData\Debloat`, which standard users can write to. The remediation script removes its old files from there and unregisters any `McAfeeRemovalPostReboot` task that points outside the secured folder.
 - Internet access is required during remediation to fetch the cleanup ZIPs from this repository (`raw.githubusercontent.com/IT-Zero-Ltd/McAfee-Script-Uninstall`), pinned to a specific commit.
 - Each ZIP is SHA256-verified before it is reused, extracted or run; a mismatched file is deleted and never executed.
 - To update the payloads, commit the new ZIPs, then update `$PayloadCommit` and both SHA256 values in `mcafee_remediate.ps1` together.

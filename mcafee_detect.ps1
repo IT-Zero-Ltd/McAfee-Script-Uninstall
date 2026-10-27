@@ -7,8 +7,22 @@ $fileThreshold = 10
 
 Write-Host "=== McAfee Detection Script ==="
 
-$debloatFolder = "C:\ProgramData\Debloat"
-$rebootMarkerPath = Join-Path $debloatFolder "McAfeeRemoval.reboot.json"
+# Must match the secured working folder used by mcafee_remediate.ps1.
+$workFolder = "C:\ProgramData\ITZero-McAfeeRemoval"
+$rebootMarkerPath = Join-Path $workFolder "McAfeeRemoval.reboot.json"
+$trustedOwnerSids = @('S-1-5-18', 'S-1-5-32-544')   # NT AUTHORITY\SYSTEM, BUILTIN\Administrators
+
+function Test-TrustedPath {
+    # True only if the item exists, is not a junction/link, and is owned by SYSTEM or Administrators.
+    param([string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { return $false }
+        $owner = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        return ($trustedOwnerSids -contains $owner)
+    }
+    catch { return $false }
+}
 
 function Get-LastBootUtc {
     try {
@@ -24,7 +38,14 @@ function Get-LastBootUtc {
 function Get-RebootMarker {
     param([string]$Path)
 
-    if (-not (Test-Path $Path)) { return $null }
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+
+    # Only honour a marker written by the remediation script. A marker a standard user could have planted
+    # (e.g. with a future date) would otherwise hide McAfee from detection indefinitely.
+    if (-not ((Test-TrustedPath -Path $workFolder) -and (Test-TrustedPath -Path $Path))) {
+        Write-Host "Ignoring reboot marker that is not owned by SYSTEM/Administrators."
+        return $null
+    }
 
     try {
         $raw = Get-Content -Path $Path -Raw -ErrorAction SilentlyContinue
@@ -40,8 +61,8 @@ function Clear-RebootMarker {
     param([string]$Path)
 
     try {
-        if (Test-Path $Path) {
-            Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+        if (Test-TrustedPath -Path $Path) {
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
         }
     }
     catch {}
@@ -60,9 +81,9 @@ if ($marker -and $marker.CreatedUtc) {
         Clear-RebootMarker -Path $rebootMarkerPath
     }
     else {
-        # Safety: do not ignore forever if reboot never happens.
-        if ($markerUtc -and (([datetime]::UtcNow - $markerUtc).TotalHours -ge 48)) {
-            Write-Host "Reboot marker is older than 48 hours. Treating as non-compliant to re-trigger remediation."
+        # Safety: do not ignore forever if reboot never happens (or if the marker's date is in the future or unreadable).
+        if ((-not $markerUtc) -or ($markerUtc -gt [datetime]::UtcNow.AddMinutes(5)) -or (([datetime]::UtcNow - $markerUtc).TotalHours -ge 48)) {
+            Write-Host "Reboot marker is older than 48 hours or has an invalid date. Treating as non-compliant to re-trigger remediation."
             exit 1
         }
 

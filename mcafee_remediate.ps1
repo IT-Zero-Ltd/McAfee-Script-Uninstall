@@ -164,6 +164,99 @@ function Get-McAfeeStatus {
     }
 }
 
+### Secure Working Folder Helpers ###
+# The working folder holds files that SYSTEM later runs (cleanup ZIPs, the post-reboot script).
+# A folder under C:\ProgramData normally inherits permissions that let standard users create files in it
+# and keep control of what they create, so it is locked down to SYSTEM + Administrators before use.
+$TrustedOwnerSids = @('S-1-5-18', 'S-1-5-32-544')   # NT AUTHORITY\SYSTEM, BUILTIN\Administrators
+
+function Test-IsReparsePoint {
+    param([string]$Path)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return [bool]($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)
+    }
+    catch { return $false }
+}
+
+function Test-TrustedOwner {
+    param([string]$Path)
+    try {
+        $owner = (Get-Acl -LiteralPath $Path -ErrorAction Stop).GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+        return ($TrustedOwnerSids -contains $owner)
+    }
+    catch { return $false }
+}
+
+function Remove-ItemSafely {
+    # Deletes a file or folder without ever following a junction or symbolic link:
+    # links are removed as links, and folders are removed with "rd /s", which does not traverse reparse points.
+    param([string]$Path)
+    $item = $null
+    try { $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop } catch { return }
+    try {
+        if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            if ($item.PSIsContainer) { [System.IO.Directory]::Delete($Path, $false) }
+            else { [System.IO.File]::Delete($Path) }
+        }
+        elseif ($item.PSIsContainer) {
+            [void](Invoke-ProcessQuiet -FilePath "cmd.exe" -ArgumentList @("/c", "rd /s /q ""$Path""") -Description ("Remove folder {0}" -f $Path))
+        }
+        else {
+            [System.IO.File]::SetAttributes($Path, [System.IO.FileAttributes]::Normal)
+            [System.IO.File]::Delete($Path)
+        }
+    }
+    catch {
+        Write-Log ("Could not remove {0}: {1}" -f $Path, $_) "WARNING"
+    }
+}
+
+function Initialize-SecureFolder {
+    # Creates (or repairs) a folder owned by SYSTEM with access for SYSTEM and Administrators only,
+    # then removes anything inside it that SYSTEM or Administrators did not create. Throws if it cannot.
+    param([string]$Path)
+
+    if (Test-Path -LiteralPath $Path) {
+        if ((Test-IsReparsePoint -Path $Path) -or -not (Test-TrustedOwner -Path $Path)) {
+            Write-Log ("Working folder {0} is a link or not owned by SYSTEM/Administrators; removing and recreating it." -f $Path) "WARNING"
+            Remove-ItemSafely -Path $Path
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -ErrorAction Stop | Out-Null
+        Write-Log ("Created working folder: {0}" -f $Path) "DEBUG"
+    }
+    if (Test-IsReparsePoint -Path $Path) {
+        throw ("Working folder {0} is a junction or link." -f $Path)
+    }
+
+    $system = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18')
+    $admins = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+    $acl = New-Object System.Security.AccessControl.DirectorySecurity
+    $acl.SetOwner($system)
+    $acl.SetAccessRuleProtection($true, $false)   # no inherited permissions from C:\ProgramData
+    foreach ($sid in @($system, $admins)) {
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
+    }
+    Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+
+    if (-not (Test-TrustedOwner -Path $Path)) {
+        throw ("Could not take ownership of working folder {0}." -f $Path)
+    }
+
+    # Anything placed here before the folder was locked down (or by a non-admin) is removed.
+    foreach ($child in @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)) {
+        if ((Test-IsReparsePoint -Path $child.FullName) -or -not (Test-TrustedOwner -Path $child.FullName)) {
+            Write-Log ("Removing untrusted item from working folder: {0}" -f $child.FullName) "WARNING"
+            Remove-ItemSafely -Path $child.FullName
+        }
+    }
+    Write-Log ("Working folder secured: {0} (SYSTEM + Administrators only)." -f $Path) "DEBUG"
+}
+
 ### Schedule Reboot at Midnight Function ###
 function Set-RebootAtMidnight {
     $now = Get-Date
@@ -187,7 +280,8 @@ function Set-RebootMarker {
             RebootCount = $RebootCount
         } | ConvertTo-Json -Compress
 
-        Set-Content -Path $MarkerPath -Value $payload -Encoding Ascii -Force
+        Remove-ItemSafely -Path $MarkerPath
+        Set-Content -LiteralPath $MarkerPath -Value $payload -Encoding Ascii -Force
         Write-Log ("Wrote reboot marker: {0} (Reason: {1})" -f $MarkerPath, $Reason) "INFO"
     }
     catch {
@@ -202,7 +296,7 @@ function Clear-RebootMarker {
 
     try {
         if (Test-Path $MarkerPath) {
-            Remove-Item -Path $MarkerPath -Force -ErrorAction SilentlyContinue
+            Remove-ItemSafely -Path $MarkerPath
             Write-Log ("Cleared reboot marker: {0}" -f $MarkerPath) "INFO"
         }
     }
@@ -272,14 +366,16 @@ function Register-PostRebootTask {
         [string]$WorkingFolder
     )
 
-    $stableScript = Join-Path $WorkingFolder "mcafee_remediate_postreboot.ps1"
+    $stableScript = $PostRebootScriptPath
 
     # $MyInvocation.MyCommand.Path is empty inside functions; use the script path captured at startup.
     try {
         if ($ThisScriptPath -and (Test-Path $ThisScriptPath)) {
-            $content = Get-Content -Path $ThisScriptPath -Raw -ErrorAction SilentlyContinue
+            $content = Get-Content -LiteralPath $ThisScriptPath -Raw -ErrorAction SilentlyContinue
             if ($content) {
-                Set-Content -Path $stableScript -Value $content -Encoding Ascii -Force
+                # Read first (this may be the staged copy itself), then replace the file rather than writing through it.
+                Remove-ItemSafely -Path $stableScript
+                Set-Content -LiteralPath $stableScript -Value $content -Encoding Ascii -Force
             }
         }
 
@@ -328,12 +424,49 @@ function Remove-PostRebootTask {
 }
 
 ### Working Folder ###
-$DebloatFolder = "C:\ProgramData\Debloat"
-if (-not (Test-Path $DebloatFolder)) {
-    New-Item -Path $DebloatFolder -ItemType Directory | Out-Null
-    Write-Log "Created working folder: $DebloatFolder" "DEBUG"
+# Dedicated, locked-down folder. Deliberately not named "McAfee..." so McAfee's own cleanup tool leaves it alone,
+# and not shared with other tooling, so its permissions can be reset safely.
+$WorkFolder = "C:\ProgramData\ITZero-McAfeeRemoval"
+try {
+    Initialize-SecureFolder -Path $WorkFolder
 }
-$RebootMarkerPath = Join-Path $DebloatFolder "McAfeeRemoval.reboot.json"
+catch {
+    Write-Log ("Could not secure working folder {0}: {1}. Stopping without running any cleanup tools." -f $WorkFolder, $_) "ERROR"
+    exit 1
+}
+$RebootMarkerPath = Join-Path $WorkFolder "McAfeeRemoval.reboot.json"
+$PostRebootScriptPath = Join-Path $WorkFolder "mcafee_remediate_postreboot.ps1"
+
+### Retire files and task from earlier versions ###
+# Earlier versions staged files in C:\ProgramData\Debloat, which standard users can write to.
+# Remove them, and remove any startup task that does not point at the secured folder, so SYSTEM never
+# runs a script from the old location again.
+$LegacyFolder = "C:\ProgramData\Debloat"
+$legacyNames = @()
+if (Test-IsReparsePoint -Path $LegacyFolder) {
+    Write-Log ("{0} is a junction or link; skipping legacy clean-up there." -f $LegacyFolder) "WARNING"
+}
+else {
+    $legacyNames = @("mcafee_remediate_postreboot.ps1", "McAfeeRemoval.reboot.json", "mcafeeclean.zip", "mccleanup.zip", "mcafeeclean_extracted", "mccleanup_extracted")
+}
+foreach ($name in $legacyNames) {
+    $legacyPath = Join-Path $LegacyFolder $name
+    if (Test-Path -LiteralPath $legacyPath) {
+        Write-Log ("Removing legacy item: {0}" -f $legacyPath) "INFO"
+        Remove-ItemSafely -Path $legacyPath
+    }
+}
+try {
+    $existingTask = Get-ScheduledTask -TaskName "McAfeeRemovalPostReboot" -ErrorAction SilentlyContinue
+    if ($existingTask) {
+        $taskArgs = ($existingTask.Actions | ForEach-Object { "$($_.Execute) $($_.Arguments)" }) -join " "
+        if ($taskArgs -notlike ("*{0}*" -f $PostRebootScriptPath)) {
+            Unregister-ScheduledTask -TaskName "McAfeeRemovalPostReboot" -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+            Write-Log "Removed startup task 'McAfeeRemovalPostReboot' that pointed outside the secured folder." "WARNING"
+        }
+    }
+}
+catch {}
 $RebootMarkerMaxAgeHours = 48
 
 if ($PostReboot) {
@@ -365,7 +498,7 @@ if ($marker -and $marker.CreatedUtc) {
         $reason = $marker.Reason
         if (-not $reason) { $reason = "Unknown" }
         Write-Log ("Reboot marker present; waiting for reboot before continuing cleanup. Reason: {0}" -f $reason) "WARNING"
-        Register-PostRebootTask -WorkingFolder $DebloatFolder
+        Register-PostRebootTask -WorkingFolder $WorkFolder
         exit 0
     }
 }
@@ -386,7 +519,7 @@ switch ($status.State) {
             exit 1
         }
         Set-RebootAtMidnight
-        Register-PostRebootTask -WorkingFolder $DebloatFolder
+        Register-PostRebootTask -WorkingFolder $WorkFolder
         Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualState" -RebootCount ($RebootCount + 1)
         exit 0
     }
@@ -410,8 +543,8 @@ $McAfeeCleanZipSha256 = "CBFCD1CE6C2CCF6B297CB7C46B916EEAA9165CAB701E4C2F26A3811
 $McCleanupZipSha256   = "6BEFD4AF1EDC0ACF327DD790100C7F680C7DC2C6C1AFB70613DF131025653065"
 
 # Local file paths
-$McAfeeCleanZipPath = Join-Path $DebloatFolder "mcafeeclean.zip"
-$McCleanupZipPath   = Join-Path $DebloatFolder "mccleanup.zip"
+$McAfeeCleanZipPath = Join-Path $WorkFolder "mcafeeclean.zip"
+$McCleanupZipPath   = Join-Path $WorkFolder "mccleanup.zip"
 
 ### Payload Integrity Check ###
 function Test-FileHashMatch {
@@ -433,7 +566,7 @@ function Test-FileHashMatch {
         return $true
     }
     Write-Log ("{0} SHA256 mismatch (expected {1}, got {2}). Deleting file." -f $Description, $ExpectedSha256, $actual) "WARNING"
-    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    Remove-ItemSafely -Path $Path
     return $false
 }
 
@@ -460,7 +593,7 @@ function Get-LocalFileIfMissing {
     }
     catch {
         Write-Log ("Failed to download {0} from {1}: {2}" -f $Description, $Url, $_) "WARNING"
-        Remove-Item -LiteralPath $LocalPath -Force -ErrorAction SilentlyContinue
+        Remove-ItemSafely -Path $LocalPath
     }
 }
 
@@ -501,7 +634,7 @@ function Start-McAfeeCleanupTool {
         Write-Log ("Extracting {0} from {1}..." -f $ToolName, $ZipPath) "INFO"
         # Always extract into a fresh, empty folder so no pre-existing files can be picked up.
         if (Test-Path $ExtractFolder) {
-            Remove-Item -LiteralPath $ExtractFolder -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-ItemSafely -Path $ExtractFolder
         }
         New-Item -ItemType Directory -Path $ExtractFolder | Out-Null
         try {
@@ -527,8 +660,8 @@ function Start-McAfeeCleanupTool {
     }
 }
 
-$ExtractFolder1 = Join-Path $DebloatFolder "mcafeeclean_extracted"
-$ExtractFolder2 = Join-Path $DebloatFolder "mccleanup_extracted"
+$ExtractFolder1 = Join-Path $WorkFolder "mcafeeclean_extracted"
+$ExtractFolder2 = Join-Path $WorkFolder "mccleanup_extracted"
 
 ### Stop McAfee kernel drivers before running cleanup tools ###
 Write-Log "Attempting to stop/disable McAfee kernel drivers before cleanup..." "INFO"
@@ -682,7 +815,7 @@ foreach ($dir in $mcAfeeDirs) {
 Write-Log "Removing temporary extraction folders..." "INFO"
 foreach ($fld in @($ExtractFolder1, $ExtractFolder2)) {
     if (Test-Path $fld) {
-        Remove-Item $fld -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-ItemSafely -Path $fld
         Write-Log ("Removed temporary folder: {0}" -f $fld) "DEBUG"
     }
 }
@@ -709,7 +842,7 @@ switch ($status.State) {
             exit 1
         }
         Set-RebootAtMidnight
-        Register-PostRebootTask -WorkingFolder $DebloatFolder
+        Register-PostRebootTask -WorkingFolder $WorkFolder
         Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualStateFinal" -RebootCount ($RebootCount + 1)
         exit 0
     }
@@ -722,7 +855,7 @@ switch ($status.State) {
             }
             Write-Log "Final detection: McAfee remnants still detected, but file locks are likely preventing cleanup. Scheduling reboot and deferring failure." "WARNING"
             Set-RebootAtMidnight
-            Register-PostRebootTask -WorkingFolder $DebloatFolder
+            Register-PostRebootTask -WorkingFolder $WorkFolder
             Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason ("FileLocks:" + ($lockIndicators -join ",")) -RebootCount ($RebootCount + 1)
             exit 0
         }
