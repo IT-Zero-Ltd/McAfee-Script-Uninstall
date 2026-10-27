@@ -56,7 +56,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoPath = (Split-Path -Parent $PSScriptRoot),
+    [string]$RepoPath,
     [switch]$IncludeFullRun,
     [switch]$Force,
     [switch]$KeepArtifacts
@@ -64,6 +64,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
+
+# $PSScriptRoot is not available in parameter defaults under Windows PowerShell 5.1, so resolve here.
+# Always use a full path: the scripts are run by a SYSTEM task whose working folder differs from ours.
+if (-not $RepoPath) { $RepoPath = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path) }
+$RepoPath = (Resolve-Path -LiteralPath $RepoPath).Path
 
 # ---------------------------------------------------------------- constants
 $WorkFolder      = 'C:\ProgramData\ITZero-McAfeeRemoval'
