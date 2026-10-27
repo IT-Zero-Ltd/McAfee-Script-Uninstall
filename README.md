@@ -29,7 +29,7 @@ High-Level Behavior
 
 - Runs cleanup in SYSTEM context and logs to:
   - `C:\ProgramData\Microsoft\IntuneManagementExtension\Logs\RemoveMcAfee.log`
-- Downloads cleanup payloads at runtime:
+- Downloads cleanup payloads at runtime from this repository (pinned commit, SHA256-verified):
   - `mcafeeclean.zip`
   - `mccleanup.zip`
 - Removes registry traces, AppX/provisioned package traces, known folders, and leftover uninstall entries.
@@ -86,7 +86,9 @@ Operational Notes
 -----------------
 
 - Must run in SYSTEM/device context for full cleanup capability.
-- Internet access is required during remediation to fetch cleanup ZIPs from GitHub.
+- Internet access is required during remediation to fetch the cleanup ZIPs from this repository (`raw.githubusercontent.com/IT-Zero-Ltd/McAfee-Script-Uninstall`), pinned to a specific commit.
+- Each ZIP is SHA256-verified before it is reused, extracted or run; a mismatched file is deleted and never executed.
+- To update the payloads, commit the new ZIPs, then update `$PayloadCommit` and both SHA256 values in `mcafee_remediate.ps1` together.
 - If network blocks GitHub, cleanup tool download will fail and removal may be incomplete.
 - Detection threshold is intentionally conservative (`10` files).
 - If you need to force re-evaluation immediately, remove marker file and rerun detection/remediation.
