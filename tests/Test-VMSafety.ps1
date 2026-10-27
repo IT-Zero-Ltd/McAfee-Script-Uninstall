@@ -399,8 +399,12 @@ try {
         $r = Invoke-AsSystem $RemediateScript -TimeoutSeconds 3600
         $log = ''
         if (Test-Path $RemediationLog) { $log = (@(Get-Content $RemediationLog) | Select-Object -Skip $logStart) -join "`n" }
-        Add-Result '10' 'Payloads downloaded from the pinned IT Zero commit and verified' (($log -match 'raw.githubusercontent.com/IT-Zero-Ltd/McAfee-Script-Uninstall/') -and ($log -match 'downloaded and verified mcafeeclean.zip') -and ($log -match 'downloaded and verified mccleanup.zip'))
-        Add-Result '10' 'McAfee cleanup tool ran from the locked-down folder' ($log -match 'Running mcafeeclean => C:\\ProgramData\\ITZero-McAfeeRemoval\\')
+        $logCopy = Join-Path $TestRoot 'scenario10-remediation-log.txt'
+        Set-Content -LiteralPath $logCopy -Value $log
+        $downloadLines = (($log -split "`n") | Where-Object { $_ -match 'Download|download|SHA256|TLS|ZIP not found|integrity|Running |Extracting' }) -join ' | '
+        if (-not $log) { $downloadLines = "no new lines in $RemediationLog" }
+        Add-Result '10' 'Payloads downloaded from the pinned IT Zero commit and verified' (($log -match 'raw.githubusercontent.com/IT-Zero-Ltd/McAfee-Script-Uninstall/') -and ($log -match 'downloaded and verified mcafeeclean.zip') -and ($log -match 'downloaded and verified mccleanup.zip')) $downloadLines
+        Add-Result '10' 'McAfee cleanup tool ran from the locked-down folder' ($log -match 'Running mcafeeclean => C:\\ProgramData\\ITZero-McAfeeRemoval\\') ("full log: " + $logCopy)
         Add-Result '10' 'Orphaned LiveSafe entry removed (uninstaller missing)' (-not (Test-Path $FakeConsumerKey))
         Add-Result '10' 'Remediation exited 0' ($r.ExitCode -eq 0) ("exit " + $r.ExitCode)
         Add-Result '10' 'No shutdown was scheduled' (-not ($log -match 'Scheduling reboot'))
