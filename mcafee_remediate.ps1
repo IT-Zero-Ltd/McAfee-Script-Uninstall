@@ -397,40 +397,86 @@ switch ($status.State) {
 
 ### URLs ###
 # Note: ServiceUI is no longer used.
-$McAfeeCleanZipUrl  = "https://github.com/nullifyac/McAfee_Removal/raw/refs/heads/main/mcafeeclean.zip"
-$McCleanupZipUrl    = "https://github.com/nullifyac/McAfee_Removal/raw/refs/heads/main/mccleanup.zip"
+# Cleanup payloads are served from IT Zero's own repository, pinned to a specific commit so the
+# files at these URLs can never change. To update the payloads: commit new zips, then update
+# $PayloadCommit and both SHA256 values below together.
+$PayloadCommit      = "2a176f5d5d283486f72132817939b2e74997d9fc"
+$PayloadBaseUrl     = "https://raw.githubusercontent.com/IT-Zero-Ltd/McAfee-Script-Uninstall/$PayloadCommit"
+$McAfeeCleanZipUrl  = "$PayloadBaseUrl/mcafeeclean.zip"
+$McCleanupZipUrl    = "$PayloadBaseUrl/mccleanup.zip"
+
+# Expected SHA256 of each payload. Anything that does not match is deleted and never extracted or run.
+$McAfeeCleanZipSha256 = "CBFCD1CE6C2CCF6B297CB7C46B916EEAA9165CAB701E4C2F26A381173596256F"
+$McCleanupZipSha256   = "6BEFD4AF1EDC0ACF327DD790100C7F680C7DC2C6C1AFB70613DF131025653065"
 
 # Local file paths
 $McAfeeCleanZipPath = Join-Path $DebloatFolder "mcafeeclean.zip"
 $McCleanupZipPath   = Join-Path $DebloatFolder "mccleanup.zip"
+
+### Payload Integrity Check ###
+function Test-FileHashMatch {
+    param(
+        [string]$Path,
+        [string]$ExpectedSha256,
+        [string]$Description
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    try {
+        $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    }
+    catch {
+        Write-Log ("Could not hash {0} at {1}: {2}" -f $Description, $Path, $_) "WARNING"
+        return $false
+    }
+    if ($actual -eq $ExpectedSha256.ToUpperInvariant()) {
+        Write-Log ("{0} SHA256 verified." -f $Description) "DEBUG"
+        return $true
+    }
+    Write-Log ("{0} SHA256 mismatch (expected {1}, got {2}). Deleting file." -f $Description, $ExpectedSha256, $actual) "WARNING"
+    Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    return $false
+}
 
 ### Download Files If Missing ###
 function Get-LocalFileIfMissing {
     param(
         [string]$Url,
         [string]$LocalPath,
+        [string]$ExpectedSha256,
         [string]$Description
     )
-    if (Test-Path $LocalPath) {
-        Write-Log ("{0} already present at {1}; skipping download." -f $Description, $LocalPath) "DEBUG"
+    # A cached copy is only reused if its hash matches; partial, corrupt or planted files are removed.
+    if (Test-FileHashMatch -Path $LocalPath -ExpectedSha256 $ExpectedSha256 -Description $Description) {
+        Write-Log ("{0} already present and verified at {1}; skipping download." -f $Description, $LocalPath) "DEBUG"
+        return
     }
-    else {
-        Write-Log ("Downloading {0} from {1}..." -f $Description, $Url) "INFO"
-        try {
-            Invoke-WebRequest -Uri $Url -OutFile $LocalPath -UseBasicParsing
-            Write-Log ("Successfully downloaded {0} => {1}" -f $Description, $LocalPath) "DEBUG"
-        }
-        catch {
-            Write-Log ("Failed to download {0} from {1}: {2}" -f $Description, $Url, $_) "WARNING"
+
+    Write-Log ("Downloading {0} from {1}..." -f $Description, $Url) "INFO"
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $LocalPath -UseBasicParsing
+        if (Test-FileHashMatch -Path $LocalPath -ExpectedSha256 $ExpectedSha256 -Description $Description) {
+            Write-Log ("Successfully downloaded and verified {0} => {1}" -f $Description, $LocalPath) "DEBUG"
         }
     }
+    catch {
+        Write-Log ("Failed to download {0} from {1}: {2}" -f $Description, $Url, $_) "WARNING"
+        Remove-Item -LiteralPath $LocalPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Windows PowerShell 5.1 can default to TLS 1.0/1.1, which GitHub refuses; make sure TLS 1.2 is enabled.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
+catch {
+    Write-Log ("Could not enable TLS 1.2: {0}" -f $_) "WARNING"
 }
 
 $downloadAttempts = 3
 $downloadDelay    = 15
 for ($i = 1; $i -le $downloadAttempts; $i++) {
-    Get-LocalFileIfMissing -Url $McAfeeCleanZipUrl -LocalPath $McAfeeCleanZipPath -Description "mcafeeclean.zip"
-    Get-LocalFileIfMissing -Url $McCleanupZipUrl   -LocalPath $McCleanupZipPath   -Description "mccleanup.zip"
+    Get-LocalFileIfMissing -Url $McAfeeCleanZipUrl -LocalPath $McAfeeCleanZipPath -ExpectedSha256 $McAfeeCleanZipSha256 -Description "mcafeeclean.zip"
+    Get-LocalFileIfMissing -Url $McCleanupZipUrl   -LocalPath $McCleanupZipPath   -ExpectedSha256 $McCleanupZipSha256   -Description "mccleanup.zip"
     if ((Test-Path $McAfeeCleanZipPath) -and (Test-Path $McCleanupZipPath)) { break }
     if ($i -lt $downloadAttempts) {
         Write-Log ("Download attempt {0} incomplete; waiting {1}s for network to become ready..." -f $i, $downloadDelay) "WARNING"
@@ -443,13 +489,21 @@ function Start-McAfeeCleanupTool {
     param(
         [string]$ZipPath,
         [string]$ExtractFolder,
+        [string]$ExpectedSha256,
         [string]$ToolName
     )
     if (Test-Path $ZipPath) {
-        Write-Log ("Extracting {0} from {1}..." -f $ToolName, $ZipPath) "INFO"
-        if (-not (Test-Path $ExtractFolder)) {
-            New-Item -ItemType Directory -Path $ExtractFolder | Out-Null
+        # Re-verify immediately before use so a file swapped after download is never run as SYSTEM.
+        if (-not (Test-FileHashMatch -Path $ZipPath -ExpectedSha256 $ExpectedSha256 -Description $ToolName)) {
+            Write-Log ("{0} failed integrity check; refusing to extract or run it." -f $ToolName) "ERROR"
+            return
         }
+        Write-Log ("Extracting {0} from {1}..." -f $ToolName, $ZipPath) "INFO"
+        # Always extract into a fresh, empty folder so no pre-existing files can be picked up.
+        if (Test-Path $ExtractFolder) {
+            Remove-Item -LiteralPath $ExtractFolder -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        New-Item -ItemType Directory -Path $ExtractFolder | Out-Null
         try {
             Expand-Archive -Path $ZipPath -DestinationPath $ExtractFolder -Force
             $exePath = Join-Path $ExtractFolder "Mccleanup.exe"
@@ -484,8 +538,8 @@ foreach ($drv in @("mfesec", "mfeelam")) {
     Write-Log ("Attempted to disable/stop driver: {0}" -f $drv) "INFO"
 }
 
-Start-McAfeeCleanupTool -ZipPath $McAfeeCleanZipPath -ExtractFolder $ExtractFolder1 -ToolName "mcafeeclean"
-Start-McAfeeCleanupTool -ZipPath $McCleanupZipPath   -ExtractFolder $ExtractFolder2 -ToolName "mccleanup"
+Start-McAfeeCleanupTool -ZipPath $McAfeeCleanZipPath -ExtractFolder $ExtractFolder1 -ExpectedSha256 $McAfeeCleanZipSha256 -ToolName "mcafeeclean"
+Start-McAfeeCleanupTool -ZipPath $McCleanupZipPath   -ExtractFolder $ExtractFolder2 -ExpectedSha256 $McCleanupZipSha256   -ToolName "mccleanup"
 
 ### Uninstall Leftover Registry Items ###
 Write-Log "Looking for Hostage Popup Installation and Uninstalling leftover McAfee items from registry..." "INFO"
