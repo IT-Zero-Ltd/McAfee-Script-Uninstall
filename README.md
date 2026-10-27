@@ -46,7 +46,7 @@ Reboot/Retry Strategy
 
 When locked files or reboot-required conditions are detected:
 
-1. Remediation schedules reboot at local midnight (`shutdown.exe /r /t <seconds>`).
+1. Remediation **does not restart the device**. It sets Datto RMM's restart flag `C:\ProgramData\CentraStage\reboot.flag` (only if the Datto agent folder exists) and Datto prompts the user to restart. Without Datto, cleanup finishes after the next normal restart.
 2. Remediation writes marker:
    - `C:\ProgramData\ITZero-McAfeeRemoval\McAfeeRemoval.reboot.json`
 3. Remediation registers one-shot startup task:
@@ -57,6 +57,10 @@ When locked files or reboot-required conditions are detected:
 4. Remediation exits `0` so HealthScripts does not record a hard failure while waiting for reboot.
 
 This is intentional to avoid repeated failed remediation runs caused by file locks that only clear after reboot.
+
+Restart tracking (`C:\ProgramData\ITZero-McAfeeRemoval\McAfeeRemoval.restarts.json`) counts only restarts that actually happened without finishing the cleanup, so a user who postpones restarting is never treated as a failure. After 3 such restarts remediation exits `1` to surface the device. The count is reset once McAfee is clean.
+
+Every external process (cleanup tool, uninstallers) has a time limit (cleanup tool 20 minutes, others 10 minutes). A process that exceeds it, e.g. an uninstaller showing hidden UI under SYSTEM, is stopped with its child processes and treated as a failed uninstall.
 
 IME/HealthScripts Hardening
 ---------------------------

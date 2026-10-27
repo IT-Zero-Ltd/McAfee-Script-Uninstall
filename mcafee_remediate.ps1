@@ -11,15 +11,17 @@
          file‑locking processes (e.g. QcShm.exe) are running (a reboot is required).
        - State 1 (“Installed”): Registry traces exist or more than 10 files remain.
   3. In the pre‑check:
-       - If state 0 (clean) or state 2 (residual), the script schedules a reboot
-         at local midnight (if residual) and exits with code 0.
+       - If state 0 (clean) or state 2 (residual), the script requests a restart
+         (if residual) and exits with code 0.
        - Only if state 1 is detected does remediation proceed.
   3b. If a reboot is pending or the script detects likely file locks preventing cleanup,
-      it schedules a reboot and registers a startup task (McAfeeRemovalPostReboot) so a second-pass cleanup runs after reboot.
+      it requests a restart and registers a startup task (McAfeeRemovalPostReboot) so a second-pass cleanup runs after reboot.
+      The script never restarts the device itself: it sets Datto RMM's reboot flag
+      (C:\ProgramData\CentraStage\reboot.flag) and Datto prompts the user.
   4. The script then downloads and runs cleanup tools, uninstalls registry items,
      removes directories and temporary files.
   5. After cleanup, it performs a final detection. If the result is state 0 or 2,
-     it schedules a reboot at midnight (if residual) and exits with 0; if state 1 is
+     it requests a restart (if residual) and exits with 0; if state 1 is
      still detected, it exits with 1 so that remediation will be re‑attempted.
 .NOTES
   Must run under SYSTEM (device context) for sufficient privileges.
@@ -55,7 +57,9 @@ function Invoke-ProcessQuiet {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
         [string[]]$ArgumentList,
-        [string]$Description = "Process"
+        [string]$Description = "Process",
+        # Uninstallers that ignore silent switches can sit on hidden UI under SYSTEM; never wait forever.
+        [int]$TimeoutSeconds = 600
     )
 
     $id = [guid]::NewGuid().ToString()
@@ -65,11 +69,17 @@ function Invoke-ProcessQuiet {
     try {
         $proc = Start-Process -FilePath $FilePath `
             -ArgumentList $ArgumentList `
-            -Wait `
             -PassThru `
             -WindowStyle Hidden `
             -RedirectStandardOutput $stdoutPath `
             -RedirectStandardError $stderrPath
+        $null = $proc.Handle   # keep a handle so ExitCode is available after exit
+
+        if (-not $proc.WaitForExit($TimeoutSeconds * 1000)) {
+            Write-Log ("{0} did not finish within {1} seconds; stopping it and its child processes." -f $Description, $TimeoutSeconds) "WARNING"
+            & taskkill.exe /PID $proc.Id /T /F 2>&1 | Out-Null
+            return $null
+        }
 
         $stderr = ""
         if (Test-Path $stderrPath) {
@@ -257,13 +267,83 @@ function Initialize-SecureFolder {
     Write-Log ("Working folder secured: {0} (SYSTEM + Administrators only)." -f $Path) "DEBUG"
 }
 
-### Schedule Reboot at Midnight Function ###
-function Set-RebootAtMidnight {
-    $now = Get-Date
-    $midnight = [datetime]::Today.AddDays(1)
-    $secondsUntilMidnight = [int]($midnight - $now).TotalSeconds
-    Write-Log ("Scheduling reboot at local midnight (in {0} seconds, at {1})." -f $secondsUntilMidnight, $midnight) "INFO"
-    shutdown.exe /r /t $secondsUntilMidnight
+### Restart Request (no forced reboot) ###
+# The script never restarts the device itself. It flags that a restart is needed and the RMM
+# (Datto RMM) prompts the user. Datto RMM treats C:\ProgramData\CentraStage\reboot.flag as "reboot required".
+$DattoRebootFlagPath = "C:\ProgramData\CentraStage\reboot.flag"
+$MaxRestartsWithoutSuccess = 3
+
+function Set-DattoRebootFlag {
+    $dattoFolder = Split-Path -Parent $DattoRebootFlagPath
+    if (-not (Test-Path -LiteralPath $dattoFolder)) {
+        Write-Log ("Datto RMM folder {0} not found; no restart flag set. Cleanup will finish after the next normal restart." -f $dattoFolder) "WARNING"
+        return
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $DattoRebootFlagPath)) {
+            New-Item -Path $DattoRebootFlagPath -ItemType File -ErrorAction Stop | Out-Null
+        }
+        Write-Log ("Restart requested via Datto RMM flag: {0}" -f $DattoRebootFlagPath) "INFO"
+    }
+    catch {
+        Write-Log ("Could not set Datto RMM restart flag {0}: {1}" -f $DattoRebootFlagPath, $_) "WARNING"
+    }
+}
+
+function Get-RestartTracking {
+    if (-not (Test-Path -LiteralPath $RestartTrackingPath)) { return $null }
+    try { return (Get-Content -LiteralPath $RestartTrackingPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
+    catch { return $null }
+}
+
+function Clear-RestartTracking {
+    if (Test-Path -LiteralPath $RestartTrackingPath) {
+        Remove-ItemSafely -Path $RestartTrackingPath
+        Write-Log "Cleared restart tracking." "DEBUG"
+    }
+}
+
+function Request-RestartForCleanup {
+    # Flags a restart and arranges the post-restart cleanup pass. Counts only restarts that actually happened
+    # and did not finish the job, so a user who postpones restarting is never counted as a failure.
+    # Returns $false (caller exits 1) once that many restarts have not been enough.
+    param([string]$Reason)
+
+    $tracking = Get-RestartTracking
+    $failedRestarts = 0
+    if ($tracking) {
+        $failedRestarts = [int]$tracking.FailedRestarts
+        $lastRequestUtc = $null
+        try { $lastRequestUtc = [datetime]::Parse($tracking.LastRequestUtc).ToUniversalTime() } catch {}
+        $bootUtc = Get-LastBootUtc
+        if ($lastRequestUtc -and $bootUtc -and ($bootUtc -gt $lastRequestUtc)) {
+            $failedRestarts++
+            Write-Log ("Device has restarted since the last request but McAfee remnants remain ({0} restart(s) so far)." -f $failedRestarts) "WARNING"
+        }
+    }
+
+    if ($failedRestarts -ge $MaxRestartsWithoutSuccess) {
+        Write-Log ("McAfee remnants remain after {0} restarts. Exiting with 1 to surface failure. Reason: {1}" -f $failedRestarts, $Reason) "ERROR"
+        try {
+            Remove-ItemSafely -Path $RestartTrackingPath
+            Set-Content -LiteralPath $RestartTrackingPath -Encoding Ascii -Force -Value (
+                [pscustomobject]@{ FailedRestarts = $failedRestarts; LastRequestUtc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Compress)
+        } catch {}
+        return $false
+    }
+
+    Set-DattoRebootFlag
+    Register-PostRebootTask -WorkingFolder $WorkFolder
+    Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason $Reason -RebootCount $failedRestarts
+    try {
+        Remove-ItemSafely -Path $RestartTrackingPath
+        Set-Content -LiteralPath $RestartTrackingPath -Encoding Ascii -Force -Value (
+            [pscustomobject]@{ FailedRestarts = $failedRestarts; LastRequestUtc = (Get-Date).ToUniversalTime().ToString("o") } | ConvertTo-Json -Compress)
+    }
+    catch {
+        Write-Log ("Failed to write restart tracking {0}: {1}" -f $RestartTrackingPath, $_) "WARNING"
+    }
+    return $true
 }
 
 function Set-RebootMarker {
@@ -485,6 +565,8 @@ catch {
     exit 1
 }
 $RebootMarkerPath = Join-Path $WorkFolder "McAfeeRemoval.reboot.json"
+# Kept separately from the marker (which detection deletes after a restart) so the count survives restarts.
+$RestartTrackingPath = Join-Path $WorkFolder "McAfeeRemoval.restarts.json"
 $PostRebootScriptPath = Join-Path $WorkFolder "mcafee_remediate_postreboot.ps1"
 
 ### Retire files and task from earlier versions ###
@@ -529,7 +611,6 @@ else {
 
 # If we previously scheduled a reboot (marker file), do not keep attempting cleanup before the reboot happens.
 $marker = Get-RebootMarker -Path $RebootMarkerPath
-$RebootCount = if ($marker -and $marker.RebootCount) { [int]$marker.RebootCount } else { 0 }
 if ($marker -and $marker.CreatedUtc) {
     $markerUtc = $null
     try { $markerUtc = [datetime]::Parse($marker.CreatedUtc).ToUniversalTime() } catch {}
@@ -559,18 +640,13 @@ switch ($status.State) {
     0 {
         Write-Log "Pre-check: McAfee appears cleanly uninstalled (no registry traces and no residual files)." "INFO"
         Clear-RebootMarker -MarkerPath $RebootMarkerPath
+        Clear-RestartTracking
         if ($PostReboot) { Remove-PostRebootTask }
         exit 0
     }
     2 {
-        Write-Log "Pre-check: Residual McAfee files detected (≤10 files with QcShm.exe running); a reboot is required to clear file locks." "INFO"
-        if ($RebootCount -ge 3) {
-            Write-Log ("Reboot limit (3) reached after {0} attempts. Exiting with 1 to surface failure." -f $RebootCount) "ERROR"
-            exit 1
-        }
-        Set-RebootAtMidnight
-        Register-PostRebootTask -WorkingFolder $WorkFolder
-        Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualState" -RebootCount ($RebootCount + 1)
+        Write-Log "Pre-check: Residual McAfee files detected (≤10 files with QcShm.exe running); a restart is required to clear file locks." "INFO"
+        if (-not (Request-RestartForCleanup -Reason "ResidualState")) { exit 1 }
         exit 0
     }
     1 {
@@ -694,7 +770,7 @@ function Start-McAfeeCleanupTool {
                 Write-Log ("Running {0} => {1}" -f $ToolName, $exePath) "INFO"
                 [void](Invoke-ProcessQuiet -FilePath $exePath `
                     -ArgumentList @("-p StopServices,MFSY,PEF,MXD,CSP,Sustainability,MOCP,MFP,APPSTATS,Auth,EMproxy,FWdiver,HW,MAS,MAT,MBK,MCPR,McProxy,McSvcHost,VUL,MHN,MNA,MOBK,MPFP,MPFPCU,MPS,SHRED,MPSCU,MQC,MQCCU,MSAD,MSHR,MSK,MSKCU,MWL,NMC,RedirSvc,VS,REMEDIATION,MSC,YAP,TRUEKEY,LAM,PCB,Symlink,SafeConnect,MGS,WMIRemover,RESIDUE -v -s") `
-                    -Description ("{0} cleanup tool" -f $ToolName))
+                    -Description ("{0} cleanup tool" -f $ToolName) -TimeoutSeconds 1200)
                 Write-Log ("{0} completed." -f $ToolName) "INFO"
             }
             else {
@@ -939,31 +1015,20 @@ switch ($status.State) {
     0 {
         Write-Log "Final detection: McAfee is cleanly uninstalled." "INFO"
         Clear-RebootMarker -MarkerPath $RebootMarkerPath
+        Clear-RestartTracking
         if ($PostReboot) { Remove-PostRebootTask }
         exit 0
     }
     2 {
-        Write-Log "Final detection: Residual McAfee files remain (≤10 files with QcShm.exe running). A reboot is required to clear file locks." "INFO"
-        if ($RebootCount -ge 3) {
-            Write-Log ("Reboot limit (3) reached after {0} attempts. Exiting with 1 to surface failure." -f $RebootCount) "ERROR"
-            exit 1
-        }
-        Set-RebootAtMidnight
-        Register-PostRebootTask -WorkingFolder $WorkFolder
-        Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason "ResidualStateFinal" -RebootCount ($RebootCount + 1)
+        Write-Log "Final detection: Residual McAfee files remain (≤10 files with QcShm.exe running). A restart is required to clear file locks." "INFO"
+        if (-not (Request-RestartForCleanup -Reason "ResidualStateFinal")) { exit 1 }
         exit 0
     }
     1 {
         # If registry traces are gone but files remain and lock indicators exist, treat as reboot-required.
         if (-not $status.FoundRegistry -and $status.TotalFiles -gt 0 -and $lockIndicators.Count -gt 0) {
-            if ($RebootCount -ge 3) {
-                Write-Log ("Reboot limit (3) reached after {0} attempts with lock indicators: {1}. Exiting with 1 to surface failure." -f $RebootCount, ($lockIndicators -join ",")) "ERROR"
-                exit 1
-            }
-            Write-Log "Final detection: McAfee remnants still detected, but file locks are likely preventing cleanup. Scheduling reboot and deferring failure." "WARNING"
-            Set-RebootAtMidnight
-            Register-PostRebootTask -WorkingFolder $WorkFolder
-            Set-RebootMarker -MarkerPath $RebootMarkerPath -Reason ("FileLocks:" + ($lockIndicators -join ",")) -RebootCount ($RebootCount + 1)
+            Write-Log "Final detection: McAfee remnants still detected, but file locks are likely preventing cleanup. Requesting a restart and deferring failure." "WARNING"
+            if (-not (Request-RestartForCleanup -Reason ("FileLocks:" + ($lockIndicators -join ",")))) { exit 1 }
             exit 0
         }
 
