@@ -92,6 +92,57 @@ if ($marker -and $marker.CreatedUtc) {
     }
 }
 
+### Managed (enterprise) McAfee / Trellix guard (must match mcafee_remediate.ps1) ###
+# This remediation targets consumer McAfee (OEM pre-installs such as LiveSafe, Total Protection, WebAdvisor,
+# Security Scan Plus, Safe Connect). Its cleanup tool and folder removal would also destroy centrally managed
+# McAfee/Trellix endpoint products, so if any sign of those is present the device is left alone.
+$ManagedProductPatterns = @(
+    '*McAfee Agent*', '*Endpoint Security*', '*VirusScan Enterprise*', '*Data Exchange Layer*',
+    '*Host Intrusion Prevention*', '*Drive Encryption*', '*Endpoint Encryption*', '*DLP Endpoint*',
+    '*Data Loss Prevention*', '*Active Response*', '*Application Control*', '*Change Control*',
+    '*Solidifier*', '*Policy Auditor*', '*Management of Native Encryption*',
+    '*File and Removable Media Protection*', '*ePolicy Orchestrator*', '*Trellix*', '*MVISION*', '*Skyhigh*'
+)
+$ManagedServiceNames = @('masvc', 'macmnsvc')   # McAfee/Trellix Agent services (ePO / Trellix management)
+$ManagedPaths = @(
+    'C:\Program Files\McAfee\Agent',
+    'C:\Program Files (x86)\McAfee\Common Framework',
+    'C:\Program Files\McAfee\Endpoint Security',
+    'C:\Program Files\Trellix'
+)
+
+function Get-ManagedMcAfeeIndicators {
+    $hits = New-Object System.Collections.Generic.List[string]
+    foreach ($rp in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                      "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")) {
+        if (-not (Test-Path $rp)) { continue }
+        foreach ($entry in @(Get-ChildItem -Path $rp -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue)) {
+            $name = [string]$entry.DisplayName
+            $publisher = [string]$entry.Publisher
+            if (-not $name) { continue }
+            # Only consider entries from McAfee/Trellix (Musarubra is Trellix's legal entity).
+            if (($name -notmatch 'McAfee|Trellix') -and ($publisher -notmatch 'McAfee|Trellix|Musarubra')) { continue }
+            foreach ($pattern in $ManagedProductPatterns) {
+                if ($name -like $pattern) { $hits.Add("Product:$name"); break }
+            }
+        }
+    }
+    foreach ($svc in $ManagedServiceNames) {
+        if (Get-Service -Name $svc -ErrorAction SilentlyContinue) { $hits.Add("Service:$svc") }
+    }
+    foreach ($path in $ManagedPaths) {
+        if (Test-Path -LiteralPath $path) { $hits.Add("Path:$path") }
+    }
+    return ,$hits.ToArray()
+}
+
+$managed = Get-ManagedMcAfeeIndicators
+if ($managed.Count -gt 0) {
+    Write-Host ("Managed McAfee/Trellix detected ({0}). Device is out of scope for this remediation." -f ($managed -join "; "))
+    Write-Host "Exit Code 0"
+    exit 0
+}
+
 $foundRegistry = $false
 $totalFiles = 0
 $directoryFileCounts = @{}
@@ -103,7 +154,8 @@ $regPaths = @(
 )
 foreach ($rp in $regPaths) {
     if (Test-Path $rp) {
-        $mcAfeeMatches = Get-ItemProperty -Path $rp -ErrorAction SilentlyContinue | Where-Object { 
+        # Read each subkey (one per installed product), not the Uninstall key itself.
+        $mcAfeeMatches = Get-ChildItem -Path $rp -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue | Where-Object { 
             $_.DisplayName -like "*McAfee*"
         }
         

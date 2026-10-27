@@ -423,6 +423,56 @@ function Remove-PostRebootTask {
     catch {}
 }
 
+### Managed (enterprise) McAfee / Trellix guard ###
+# This remediation targets consumer McAfee (OEM pre-installs such as LiveSafe, Total Protection, WebAdvisor,
+# Security Scan Plus, Safe Connect). Its cleanup tool and folder removal would also destroy centrally managed
+# McAfee/Trellix endpoint products, so if any sign of those is present the device is left alone.
+$ManagedProductPatterns = @(
+    '*McAfee Agent*', '*Endpoint Security*', '*VirusScan Enterprise*', '*Data Exchange Layer*',
+    '*Host Intrusion Prevention*', '*Drive Encryption*', '*Endpoint Encryption*', '*DLP Endpoint*',
+    '*Data Loss Prevention*', '*Active Response*', '*Application Control*', '*Change Control*',
+    '*Solidifier*', '*Policy Auditor*', '*Management of Native Encryption*',
+    '*File and Removable Media Protection*', '*ePolicy Orchestrator*', '*Trellix*', '*MVISION*', '*Skyhigh*'
+)
+$ManagedServiceNames = @('masvc', 'macmnsvc')   # McAfee/Trellix Agent services (ePO / Trellix management)
+$ManagedPaths = @(
+    'C:\Program Files\McAfee\Agent',
+    'C:\Program Files (x86)\McAfee\Common Framework',
+    'C:\Program Files\McAfee\Endpoint Security',
+    'C:\Program Files\Trellix'
+)
+
+function Get-ManagedMcAfeeIndicators {
+    $hits = New-Object System.Collections.Generic.List[string]
+    foreach ($rp in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                      "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall")) {
+        if (-not (Test-Path $rp)) { continue }
+        foreach ($entry in @(Get-ChildItem -Path $rp -ErrorAction SilentlyContinue | Get-ItemProperty -ErrorAction SilentlyContinue)) {
+            $name = [string]$entry.DisplayName
+            $publisher = [string]$entry.Publisher
+            if (-not $name) { continue }
+            # Only consider entries from McAfee/Trellix (Musarubra is Trellix's legal entity).
+            if (($name -notmatch 'McAfee|Trellix') -and ($publisher -notmatch 'McAfee|Trellix|Musarubra')) { continue }
+            foreach ($pattern in $ManagedProductPatterns) {
+                if ($name -like $pattern) { $hits.Add("Product:$name"); break }
+            }
+        }
+    }
+    foreach ($svc in $ManagedServiceNames) {
+        if (Get-Service -Name $svc -ErrorAction SilentlyContinue) { $hits.Add("Service:$svc") }
+    }
+    foreach ($path in $ManagedPaths) {
+        if (Test-Path -LiteralPath $path) { $hits.Add("Path:$path") }
+    }
+    return ,$hits.ToArray()
+}
+
+$managed = Get-ManagedMcAfeeIndicators
+if ($managed.Count -gt 0) {
+    Write-Log ("Managed McAfee/Trellix detected ({0}). This device is out of scope; no changes made." -f ($managed -join "; ")) "WARNING"
+    exit 0
+}
+
 ### Working Folder ###
 # Dedicated, locked-down folder. Deliberately not named "McAfee..." so McAfee's own cleanup tool leaves it alone,
 # and not shared with other tooling, so its permissions can be reset safely.
@@ -687,6 +737,10 @@ Write-Log "Attempting silent uninstall of McAfee Security Scan Plus..." "INFO"
 } else {
     Write-Log "Uninstaller not found at expected location: $mcAfeeUninstaller" "INFO"
 }
+# Exit codes treated as a successful uninstall: 0 OK, 1605 product not installed, 1614 product uninstalled,
+# 1641 / 3010 success but restart needed.
+$UninstallSuccessCodes = @(0, 1605, 1614, 1641, 3010)
+$UninstallResults = @{}   # uninstall registry key path -> exit code
 foreach ($rp in $regPaths) {
     if (Test-Path $rp) {
         $apps = Get-ChildItem $rp -ErrorAction SilentlyContinue |
@@ -696,18 +750,21 @@ foreach ($rp in $regPaths) {
             $uninstallCmd = $app.UninstallString
             $dispName = $app.DisplayName
             if ($uninstallCmd) {
+                $exitCode = $null
                 Write-Log ("Attempting uninstall of {0}" -f $dispName) "INFO"
                 try {
                     if ($uninstallCmd -match "^msiexec") {
                         $msiArgs = $uninstallCmd -replace "msiexec.exe",""
                         $msiArgs = $msiArgs -replace "/I","/X "
                         if ($msiArgs -notmatch "/quiet") { $msiArgs += " /quiet /norestart" }
-                        [void](Invoke-ProcessQuiet -FilePath "msiexec.exe" -ArgumentList @($msiArgs) -Description ("Uninstall {0}" -f $dispName))
+                        $exitCode = Invoke-ProcessQuiet -FilePath "msiexec.exe" -ArgumentList @($msiArgs) -Description ("Uninstall {0}" -f $dispName)
                     }
                     else {
                         if ($uninstallCmd -notmatch "/quiet") { $uninstallCmd += " /quiet /norestart" }
-                        [void](Invoke-ProcessQuiet -FilePath "cmd.exe" -ArgumentList @("/c", $uninstallCmd) -Description ("Uninstall {0}" -f $dispName))
+                        $exitCode = Invoke-ProcessQuiet -FilePath "cmd.exe" -ArgumentList @("/c", $uninstallCmd) -Description ("Uninstall {0}" -f $dispName)
                     }
+                    $UninstallResults[[string]$app.PSPath] = $exitCode
+                    Write-Log ("Uninstall of {0} exited with code {1}" -f $dispName, $exitCode) "INFO"
                 }
                 catch {
                     Write-Log ("Failed uninstall of {0}: {1}" -f $dispName, $_) "WARNING"
@@ -762,20 +819,70 @@ catch {
     Write-Log ("Failed to remove McAfee AppX package: {0}" -f $_) "WARNING"
 }
 
-Write-Log "Removing leftover McAfee registry entries..." "INFO"
+function ConvertTo-PackedGuid {
+    # MSI stores product codes under HKLM:\SOFTWARE\Classes\Installer\Products in "packed" form.
+    param([string]$Guid)
+    $g = ($Guid -replace '[{}-]', '').ToUpperInvariant()
+    if ($g -notmatch '^[0-9A-F]{32}$') { return $null }
+    $rev = { param($t) -join ($t.ToCharArray()[($t.Length - 1)..0]) }
+    $packed = (& $rev $g.Substring(0, 8)) + (& $rev $g.Substring(8, 4)) + (& $rev $g.Substring(12, 4))
+    for ($i = 16; $i -lt 32; $i += 2) { $packed += $g[$i + 1] + $g[$i] }
+    return $packed
+}
+
+function Get-UninstallExecutablePath {
+    param([string]$Command)
+    if (-not $Command) { return $null }
+    $cmd = [Environment]::ExpandEnvironmentVariables($Command.Trim())
+    if ($cmd -match '^"([^"]+)"') { return $Matches[1] }
+    if ($cmd -match '^(.+?\.exe)\b') { return $Matches[1] }
+    return $null
+}
+
+function Test-UninstallEntryOrphaned {
+    # True only when there is clear evidence the product is no longer installed. When unsure, returns false
+    # so the entry is kept and detection keeps reporting it.
+    param($Entry)
+    $cmd = [string]$Entry.UninstallString
+    if (-not $cmd) {
+        $loc = [string]$Entry.InstallLocation
+        return (-not $loc) -or -not (Test-Path -LiteralPath $loc)
+    }
+    if ($cmd -match 'msiexec') {
+        if ($cmd -match '\{[0-9A-Fa-f\-]{36}\}') {
+            $packed = ConvertTo-PackedGuid -Guid $Matches[0]
+            if ($packed) { return -not (Test-Path ("HKLM:\SOFTWARE\Classes\Installer\Products\{0}" -f $packed)) }
+        }
+        return $false
+    }
+    $exe = Get-UninstallExecutablePath -Command $cmd
+    if (-not $exe) { return $false }
+    return -not (Test-Path -LiteralPath $exe)
+}
+
+# Only remove an uninstall entry when its uninstaller reported success or the product is verifiably gone.
+# Entries for products that failed to uninstall are kept, so detection keeps flagging the device.
+Write-Log "Removing leftover McAfee registry entries for products that are no longer installed..." "INFO"
 foreach ($rp in $regPaths) {
     if (Test-Path $rp) {
-        Get-ChildItem $rp -ErrorAction SilentlyContinue | ForEach-Object {
-            $dn = $_.GetValue("DisplayName")
-            if ($dn -and ($dn -like "*McAfee*")) {
+        foreach ($key in @(Get-ChildItem $rp -ErrorAction SilentlyContinue)) {
+            $dn = $key.GetValue("DisplayName")
+            if (-not ($dn -and ($dn -like "*McAfee*"))) { continue }
+            $entry = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            $keyPath = [string]$key.PSPath
+            $code = $UninstallResults[$keyPath]
+            $succeeded = ($null -ne $code) -and ($UninstallSuccessCodes -contains [int]$code)
+            if ($succeeded -or (Test-UninstallEntryOrphaned -Entry $entry)) {
                 try {
-                    $regKeyPath = $_.PSPath
-                    Remove-Item -LiteralPath $regKeyPath -Recurse -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction Stop
                     Write-Log ("Removed registry entry: {0}" -f $dn) "DEBUG"
                 }
                 catch {
                     Write-Log ("Could not remove registry entry for {0}: {1}" -f $dn, $_) "WARNING"
                 }
+            }
+            else {
+                Write-Log ("Keeping registry entry for {0}: uninstall did not succeed (exit code {1}) and the product still appears to be installed." -f $dn, $(if ($null -eq $code) { "none" } else { $code })) "WARNING"
             }
         }
     }
